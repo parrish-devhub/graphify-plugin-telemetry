@@ -81,6 +81,8 @@ pub enum IngestError {
     Json(#[from] serde_json::Error),
     #[error("db error: {0}")]
     Db(#[from] rusqlite::Error),
+    #[error("draco error: {0}")]
+    Draco(#[from] crate::draco_client::DracoError),
 }
 
 #[cfg(test)]

@@ -1,29 +1,75 @@
-//! Draco MCP client 骨架 — 對「以 System User 運行的可觀測性 Draco MCP
+//! Draco MCP client — 對「以 System User 運行的可觀測性 Draco MCP
 //! Server」（Prometheus / OTEL / Jaeger / pprof scraper）發起 MCP-over-HTTP
 //! 呼叫。
 //!
-//! Slice 0 只落 framing 骨架（initialize handshake + tools/call），不做真呼叫
-//! —— ingest 主路徑是 file-based import（零 Draco 介面風險）。Slice 1/2
-//! 接 Draco 4 tools 時在此擴充。
+//! Slice 0 只落 framing 骨架（initialize handshake + tools/call）；Slice 1
+//! 實作 `fetch_top_hotspots`（一鍵同步 Top 熱點）。
 //!
 //! Draco 的 MCP-over-HTTP handshake 與 CRG 同構（`initialize` → session id →
 //! `tools/call`），framing 沿用 code-review-graph client 的實測格式。
+//!
+//! **契約 v1（本 plugin 定義）**：public 不存在 observability Draco
+//! （唯一 Draco 為網頁 scraper，見 2026-08-10 librarian 調查）——
+//! `fetch_top_hotspots` 回應採 server-side 聚合（traceloop envelope +
+//! pprof top-N 語意），形狀如下，註記於 openspec spec.md：
+//!
+//! ```json
+//! {
+//!   "window": { "start": "2026-08-10T00:00:00Z", "end": "2026-08-10T01:00:00Z" },
+//!   "count": 2,
+//!   "hotspots": [
+//!     { "file_path": "src/db/query.rs", "function_name": "query_users",
+//!       "p99_latency_ms": 1250.0, "call_count": 5000, "alloc_bytes": 10485760,
+//!       "environment": "production" }
+//!   ]
+//! }
+//! ```
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// Draco 可觀測性 MCP tools — Slice 0 僅確認 §5.2 提及的
-/// `fetch_top_hotspots`；完整 4 tools 清單於 Slice 1 probe 時補齊。
+/// Draco 可觀測性 MCP tools — §5.2 確認的 `fetch_top_hotspots`；
+/// 其餘工具待 Draco 端實際存在後 probe 補齊（不臆測）。
 pub const DRACO_TOOLS: [&str; 1] = ["fetch_top_hotspots"];
 
 /// 預設 Draco base url（`DRACO_BASE_URL` 環境變數覆寫）。
 ///
-/// 注意：port 未經 probe 確認，Slice 1 實測 Draco MCP 後修正（CRG 的
-/// 9877 不保證適用）。
+/// 注意：port 未經 probe 確認（CRG 的 9877 不保證適用）；待真正 Draco
+/// MCP server 部署後修正。
 #[must_use]
 pub fn default_draco_url() -> String {
     std::env::var("DRACO_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9876/mcp".to_string())
+}
+
+/// Draco `fetch_top_hotspots` 單一熱點（契約 v1）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DracoHotspot {
+    pub file_path: String,
+    pub function_name: String,
+    pub p99_latency_ms: f64,
+    #[serde(default)]
+    pub call_count: u64,
+    #[serde(default)]
+    pub alloc_bytes: i64,
+    #[serde(default = "default_environment")]
+    pub environment: String,
+}
+
+fn default_environment() -> String {
+    "production".to_string()
+}
+
+/// `fetch_top_hotspots` 回應 envelope（`{window, count, hotspots}`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DracoHotspotsResponse {
+    #[serde(default)]
+    pub window: Option<Value>,
+    #[serde(default)]
+    pub count: Option<usize>,
+    #[serde(default)]
+    pub hotspots: Vec<DracoHotspot>,
 }
 
 /// Draco MCP client（streamable HTTP transport）。
@@ -99,6 +145,54 @@ impl DracoMcpClient {
         }
     }
 
+    /// 執行 `initialize` handshake，記下 `Mcp-Session-Id` header。
+    ///
+    /// # Errors
+    /// 網路/HTTP 失敗回傳 [`ureq::Error`]（轉為 [`DracoError::Ureq`]）。
+    pub fn initialize(&mut self) -> Result<(), DracoError> {
+        let resp = ureq::post(&self.base_url)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream")
+            .timeout(Duration::from_secs(10))
+            .send_json(Self::initialize_request())?;
+        self.session_id = resp.header("Mcp-Session-Id").map(ToString::to_string);
+        Ok(())
+    }
+
+    /// 一鍵拉取 Draco 的 Top 熱點（server-side 聚合；`limit` 為 `None`
+    /// 時交 Draco 預設，通常 Top 10）。
+    ///
+    /// 自動完成 `initialize` handshake（若尚未初始化）。回傳熱點清單，
+    /// 依 server 排序（p99 降冪）。
+    ///
+    /// # Errors
+    /// 網路 / MCP framing / 契約解析失敗回傳 [`DracoError`]。
+    pub fn fetch_top_hotspots(
+        &mut self,
+        limit: Option<usize>,
+    ) -> Result<Vec<DracoHotspot>, DracoError> {
+        if self.session_id.is_none() {
+            self.initialize()?;
+        }
+        let args = match limit {
+            Some(n) => json!({ "limit": n }),
+            None => json!({}),
+        };
+        let raw = self.call_tool("fetch_top_hotspots", &args)?;
+        Self::parse_hotspots(&raw)
+    }
+
+    /// 從 Draco `tools/call` 回傳的 text（已是契約 JSON，`call_tool`
+    /// 已剝掉 MCP envelope）解析 `fetch_top_hotspots` 回應。
+    ///
+    /// # Errors
+    /// text 非契約 JSON 回傳 [`DracoError::Parse`]。
+    pub fn parse_hotspots(raw: &str) -> Result<Vec<DracoHotspot>, DracoError> {
+        let resp: DracoHotspotsResponse =
+            serde_json::from_str(raw).map_err(|e| DracoError::Parse(e.to_string()))?;
+        Ok(resp.hotspots)
+    }
+
     /// 執行 `tools/call`（streamable HTTP POST）。回傳合併後的 text 內容。
     ///
     /// # Errors
@@ -132,6 +226,8 @@ pub enum DracoError {
     NotInitialized,
     #[error("empty result from Draco")]
     EmptyResult,
+    #[error("parse error: {0}")]
+    Parse(String),
 }
 
 impl From<ureq::Error> for DracoError {
@@ -198,5 +294,81 @@ mod tests {
     #[test]
     fn default_url_respects_env() {
         assert!(default_draco_url().starts_with("http://"));
+    }
+
+    #[test]
+    fn parses_hotspots_contract() {
+        let raw = r#"{
+            "window": { "start": "2026-08-10T00:00:00Z", "end": "2026-08-10T01:00:00Z" },
+            "count": 2,
+            "hotspots": [
+                { "file_path": "src/db/query.rs", "function_name": "query_users",
+                  "p99_latency_ms": 1250.0, "call_count": 5000, "alloc_bytes": 10485760 },
+                { "file_path": "src/payment/stripe.rs", "function_name": "process_payment",
+                  "p99_latency_ms": 2450.0, "environment": "staging" }
+            ]
+        }"#;
+        let resp: DracoHotspotsResponse =
+            serde_json::from_str(raw).expect("contract JSON must parse");
+        assert_eq!(resp.count, Some(2));
+        assert_eq!(resp.hotspots.len(), 2);
+        // environment 缺省 = production
+        assert_eq!(resp.hotspots[0].environment, "production");
+        assert_eq!(resp.hotspots[1].environment, "staging");
+        // 缺省數值為 0（call_count / alloc_bytes 可選）
+        assert_eq!(resp.hotspots[1].call_count, 0);
+    }
+
+    #[test]
+    fn parse_hotspots_tolerates_missing_hotspots() {
+        // 契約 lenient：缺 hotspots 欄位 = 無熱點，非錯誤。
+        let raw = r#"{"count": 1}"#;
+        let hotspots = DracoMcpClient::parse_hotspots(raw).unwrap();
+        assert!(hotspots.is_empty());
+    }
+
+    /// 用臨時 TcpListener 起一個迷你 Draco（initialize + tools/call 兩段
+    /// handshake），驗證 `fetch_top_hotspots` 完整 HTTP 旅程。這是真連線
+    /// 測試（非 mock 實作），只是 Draco 端用 fixture 回應。
+    #[test]
+    fn fetch_top_hotspots_e2e() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            // 兩段 handshake：initialize → tools/call
+            let hotspot_json = r#"{"window":{"start":"2026-08-10T00:00:00Z","end":"2026-08-10T01:00:00Z"},"count":1,"hotspots":[{"file_path":"src/db/query.rs","function_name":"query_users","p99_latency_ms":1250.0,"call_count":5000,"alloc_bytes":10485760}]}"#;
+            for (i, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).unwrap();
+                let body = if i == 0 {
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fake-draco","version":"0.0.0"}}}"#
+                } else {
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":{}}}]}}}}"#,
+                        serde_json::to_string(hotspot_json).unwrap()
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: ses-e2e\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let mut client =
+            DracoMcpClient::new(format!("http://{addr}/mcp"));
+        let hotspots = client.fetch_top_hotspots(Some(10)).unwrap();
+        assert_eq!(hotspots.len(), 1);
+        assert_eq!(hotspots[0].function_name, "query_users");
+        assert_eq!(hotspots[0].p99_latency_ms, 1250.0);
+        assert_eq!(hotspots[0].call_count, 5000);
+        assert_eq!(hotspots[0].environment, "production");
     }
 }

@@ -10,7 +10,7 @@
 //! `start_line <= line <= end_line` 的節點；多個重疊時取 span 最小者
 //! （最內層 symbol，如 function 而非其所在的 class/module）。
 
-use graphify_core::types::{GraphOutput, NodeId};
+use graphify_core::types::{GraphOutput, Node, NodeId};
 
 /// 一次解析結果：命中節點 + 其 canonical id。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,8 +51,52 @@ pub fn resolve_line(
     })
 }
 
-/// `node_path` 是否代表 `want`（workspace-root 相對路徑）。
-/// 精確相等，或兩者都以 `/` 分隔且 node_path 以 `want` 結尾。
+/// 對 `graph` 做 symbol 掃，將 `(file_path, function_name)` 解析為對應節點。
+///
+/// Draco 這類 profiler 只給 symbol 不給行號（line_number 未知），無法用
+/// [`resolve_line`]；這裡依 file 相符 + name 相符（`function_name` 或
+/// `::` 尾段 leaf 相符）挑節點：優先 `kind == "function"`，其次取 name
+/// 最長相符者（避免同名葉節點取錯）。回傳 `None` = 檔案或 symbol 不在
+/// graph（orphan）。
+#[must_use]
+pub fn resolve_symbol(
+    graph: &GraphOutput,
+    file_path: &str,
+    function_name: &str,
+) -> Option<Resolved> {
+    if function_name.is_empty() {
+        return None;
+    }
+    let leaf = function_name.rsplit("::").next().unwrap_or(function_name);
+    let mut best: Option<&Node> = None;
+    let mut best_is_fn = false;
+    let mut best_name_len = 0usize;
+
+    for node in &graph.nodes {
+        if !file_matches(&node.source_file, file_path) {
+            continue;
+        }
+        let node_name = node.id.0.rsplit(':').next().unwrap_or("");
+        let node_leaf = node_name.rsplit("::").next().unwrap_or(node_name);
+        if node_leaf != leaf {
+            continue;
+        }
+        let is_fn = node.kind == "function";
+        let len = node_name.len();
+        if best.is_none() || (is_fn && !best_is_fn) || (is_fn == best_is_fn && len > best_name_len)
+        {
+            best = Some(node);
+            best_is_fn = is_fn;
+            best_name_len = len;
+        }
+    }
+
+    best.map(|n| Resolved {
+        node_id: n.id.clone(),
+    })
+}
+
+/// `node_path` 是否代表 `want`（workspace-root 相對路徑）。/// 精確相等，或兩者都以 `/` 分隔且 node_path 以 `want` 結尾。
 #[must_use]
 pub fn file_matches(node_path: &str, want: &str) -> bool {
     if node_path == want {
@@ -87,7 +131,7 @@ mod tests {
             id: NodeId(id.to_string()),
             label: id.rsplit(':').next().unwrap_or(id).to_string(),
             file_type: FileType::Code,
-            kind: "function".to_string(),
+            kind: id.split(':').nth(1).unwrap_or("function").to_string(),
             language: "rust".to_string(),
             source_file: source_file.to_string(),
             start_line: start,
@@ -162,5 +206,56 @@ mod tests {
         assert!(!file_matches("src/auth.rs", "auth.rs")); // 純檔名不做 suffix
         assert!(!file_matches("src/foosrc/auth.rs", "src/auth.rs"));
         assert!(file_matches("src/foosrc/auth.rs", "src/foosrc/auth.rs"));
+    }
+
+    #[test]
+    fn resolves_symbol_by_function_name() {
+        let g = graph_with(vec![node(
+            "src/db/query.rs:function:query_users",
+            "src/db/query.rs",
+            80,
+            120,
+        )]);
+        let r = resolve_symbol(&g, "src/db/query.rs", "query_users").unwrap();
+        assert_eq!(r.node_id.0, "src/db/query.rs:function:query_users");
+    }
+
+    #[test]
+    fn resolves_symbol_leaf_of_namespaced_name() {
+        let g = graph_with(vec![node(
+            "src/db/query.rs:function:query_users",
+            "src/db/query.rs",
+            80,
+            120,
+        )]);
+        // Draco/pprof 的 symbol 常帶 crate/module 前綴（crate::db::query_users）
+        let r = resolve_symbol(&g, "src/db/query.rs", "crate::db::query_users").unwrap();
+        assert_eq!(r.node_id.0, "src/db/query.rs:function:query_users");
+    }
+
+    #[test]
+    fn symbol_prefers_function_over_same_leaf_name() {
+        let g = graph_with(vec![
+            node("src/db/query.rs:module:query_users", "src/db/query.rs", 1, 200),
+            node("src/db/query.rs:function:query_users", "src/db/query.rs", 80, 120),
+        ]);
+        let r = resolve_symbol(&g, "src/db/query.rs", "query_users").unwrap();
+        assert_eq!(r.node_id.0, "src/db/query.rs:function:query_users");
+    }
+
+    #[test]
+    fn symbol_orphan_cases() {
+        let g = graph_with(vec![node(
+            "src/db/query.rs:function:query_users",
+            "src/db/query.rs",
+            80,
+            120,
+        )]);
+        // 檔案不在 graph
+        assert!(resolve_symbol(&g, "src/other.rs", "query_users").is_none());
+        // symbol 不在 graph
+        assert!(resolve_symbol(&g, "src/db/query.rs", "query_orders").is_none());
+        // 空 function_name
+        assert!(resolve_symbol(&g, "src/db/query.rs", "").is_none());
     }
 }

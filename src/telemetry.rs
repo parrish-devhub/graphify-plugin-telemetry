@@ -8,9 +8,11 @@
 //! - 查詢：依 canonical node id 取其效能綁定。
 //! - hotspot 合成：is_hotspot 綁定 → HotspotView → §6 可觀測性區塊。
 //!
-//! 門檻（Slice 0 常量；Slice 1 改動態設定）：p99 > 1000ms（schema §3.2
-//! comment）或 alloc/req > 5MB（Slice 1 範例值）即標 hotspot。
+//! 門檻（動態設定，預設 500ms / 5MB，見 [`ThresholdConfig`]）：p99 > 500ms
+//! 或 alloc/req > 5MB 即標 hotspot。
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -18,9 +20,9 @@ use graphify_core::plugin::GraphUpdateEvent;
 use graphify_core::{from_toon, GraphOutput};
 
 use crate::draco_client::{default_draco_url, DracoMcpClient};
-use crate::ingest::{parse_payload_file, IngestError, TelemetryIngestPayload};
+use crate::ingest::{parse_payload_file, IngestError, Metric, TelemetryIngestPayload};
 use crate::registry::{TelemetryBinding, TelemetryDb};
-use crate::resolver::resolve_line;
+use crate::resolver::{resolve_line, resolve_symbol};
 use crate::sync::{emit_error_packet, emit_packet, synthesize_hotspot_block, HotspotView};
 
 /// 動態熱點門檻（Slice 1：動態門檻設定）。
@@ -208,9 +210,17 @@ impl TelemetryService {
         let mut hotspots = 0usize;
 
         for metric in &payload.metrics {
+            // line 未知（Draco 只給 symbol）時退到 symbol 解析；有行號仍
+            // 以 line→symbol（最內層 span）為準。
             let canonical = graph
                 .as_ref()
-                .and_then(|g| resolve_line(g, &metric.file_path, metric.line_number))
+                .and_then(|g| {
+                    if metric.line_number > 0 {
+                        resolve_line(g, &metric.file_path, metric.line_number)
+                    } else {
+                        resolve_symbol(g, &metric.file_path, &metric.function_name)
+                    }
+                })
                 .map(|r| r.node_id.0)
                 .unwrap_or_default();
 
@@ -247,6 +257,50 @@ impl TelemetryService {
             orphan,
             hotspots,
         })
+    }
+
+    /// `telemetry_ingest`（source = "draco-mcp"）：呼叫 Draco
+    /// `fetch_top_hotspots()`，將 server 聚合的 Top 熱點轉譯為
+    /// IngestPayload 後走同一條 ingest 管線（symbol 解析 + 門檻 + 寫入）。
+    ///
+    /// metric_id 由 `file_path:function_name` 安定雜湊派生
+    /// （`tel-draco-{hash}`）——重複同步會 upsert 同一列，不產生重複
+    /// binding。workspace_key 用 plugin 綁定的 key（與 review 的教訓
+    /// 一致：bindings 不信任 payload 外來 key）。
+    ///
+    /// # Errors
+    /// Draco 呼叫 / 契約解析 / db 寫入失敗回傳
+    /// [`crate::ingest::IngestError`]。
+    pub fn telemetry_ingest_draco(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<IngestReport, IngestError> {
+        let mut client = self.draco_client.clone();
+        let hotspots = client.fetch_top_hotspots(limit)?;
+        let now = crate::sync::now_rfc3339();
+        let wk = self.workspace_key.clone();
+        let metrics: Vec<Metric> = hotspots
+            .into_iter()
+            .map(|h| Metric {
+                metric_id: draco_metric_id(&h.file_path, &h.function_name),
+                file_path: h.file_path,
+                function_name: h.function_name,
+                line_number: 0,
+                p50_ms: 0.0,
+                p99_ms: h.p99_latency_ms,
+                alloc_bytes_per_req: h.alloc_bytes,
+                call_count_per_min: i64::try_from(h.call_count).unwrap_or(i64::MAX),
+                environment: h.environment,
+                recorded_at: now.clone(),
+            })
+            .collect();
+        let payload = TelemetryIngestPayload {
+            version: "1.0".to_string(),
+            source: "draco-mcp".to_string(),
+            workspace_key: wk,
+            metrics,
+        };
+        self.telemetry_ingest(&payload)
     }
 
     /// `telemetry_get_context`：查詢指定 canonical node 的效能綁定。
@@ -343,6 +397,16 @@ impl TelemetryService {
     pub fn on_graph_updated(&self, _event: &GraphUpdateEvent) {
         // Slice 2：若 delta.modified_nodes 含 is_hotspot 節點 → 廣播 alert。
     }
+}
+
+/// Draco 熱點的安定 metric id：`tel-draco-{DefaultHasher(file:func):x}`。
+/// DefaultHasher（SipHash13，固定 key）跨 run 確定；同一 symbol 重複同步
+/// 會更新同一列（upsert 同 PK），不產生重複 binding。
+fn draco_metric_id(file_path: &str, function_name: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    file_path.hash(&mut hasher);
+    function_name.hash(&mut hasher);
+    format!("tel-draco-{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
@@ -547,5 +611,95 @@ mod tests {
         let report = svc.telemetry_ingest_file(&path).unwrap();
         assert_eq!(report.bound, 1);
         assert_eq!(report.hotspots, 1);
+    }
+
+    #[test]
+    fn ingest_binds_by_symbol_when_line_unknown() {
+        // Draco 只給 symbol 不給行號：line_number = 0 → resolve_symbol
+        // 兜底，file + function_name 相符即可綁定。
+        let (_d, svc) = service_with_tmp_db();
+        feed_graph(&svc);
+        let mut m = metric("tel-s1", 1250.0, 1024);
+        m.line_number = 0;
+        let report = svc.telemetry_ingest(&payload("w-1", vec![m])).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.bound, 1);
+        assert_eq!(report.orphan, 0);
+        // 綁定至正確 canonical id
+        let (_node, rows) = svc
+            .telemetry_get_context("w-1", "src/db/query.rs:function:query_users", false)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "tel-s1");
+    }
+
+    #[test]
+    fn draco_ingest_e2e_binds_and_is_stable() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hotspot_json = r#"{"window":{"start":"2026-08-10T00:00:00Z","end":"2026-08-10T01:00:00Z"},"count":1,"hotspots":[{"file_path":"src/db/query.rs","function_name":"query_users","p99_latency_ms":1250.0,"call_count":5000,"alloc_bytes":10485760}]}"#;
+        // 每次 telemetry_ingest_draco 兩段 handshake（initialize + tools/call）；
+        // 跑兩次 sync 驗證安定性。
+        thread::spawn(move || {
+            for i in 0..4 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).unwrap();
+                    let body = if i % 2 == 0 {
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fake-draco","version":"0.0.0"}}}"#
+                    } else {
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":{}}}]}}}}"#,
+                            serde_json::to_string(hotspot_json).unwrap()
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: ses-e2e\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let (_d, mut svc) = service_with_tmp_db();
+        svc = svc.with_draco_url(format!("http://{addr}/mcp"));
+        svc.set_workspace_key("w-1".to_string());
+        feed_graph(&svc);
+
+        let report = svc.telemetry_ingest_draco(Some(10)).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.bound, 1, "symbol 升維成功");
+        assert_eq!(report.orphan, 0);
+        assert_eq!(report.hotspots, 1, "p99 1250ms > 500ms 門檻");
+
+        // 安定 metric id：第二次同步 upsert 同一列，不產生重複 binding。
+        let (_node, rows) = svc
+            .telemetry_get_context("w-1", "src/db/query.rs:function:query_users", false)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].id.starts_with("tel-draco-"), "id: {}", rows[0].id);
+        let id_before = rows[0].id.clone();
+        let _ = svc.telemetry_ingest_draco(Some(10)).unwrap();
+        let (_node, rows) = svc
+            .telemetry_get_context("w-1", "src/db/query.rs:function:query_users", false)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "重複 sync 不產生重複 binding");
+        assert_eq!(rows[0].id, id_before);
+    }
+
+    #[test]
+    fn draco_metric_id_is_deterministic() {
+        let a = draco_metric_id("src/db/query.rs", "query_users");
+        let b = draco_metric_id("src/db/query.rs", "query_users");
+        let c = draco_metric_id("src/db/query.rs", "query_orders");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("tel-draco-"));
     }
 }

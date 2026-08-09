@@ -76,3 +76,32 @@ Plaintext
   實作採 §5.1 內嵌範例格式（`⚡ [Draco Telemetry] p99 Latency: Xms
   (CRITICAL HOTSPOT)` + `📊 Alloc: Y | Calls: Z/min (env)`）。Impact
   Radius 行屬 Slice 2。
+
+### Draco MCP 契約 v1（fetch_top_hotspots，Slice 1 實作）
+
+2026-08 web research 確認 public 無 Draco observability server（僅
+cawa0505 同名網頁 scraper）— 契約由本 plugin 定義（greenfield）。
+`DRACO_BASE_URL`（預設 `http://127.0.0.1:9878`）指向實現本契約的 server；
+client 自動 `initialize` handshake（記 `Mcp-Session-Id` header），
+`tools/call` 呼叫 `fetch_top_hotspots`，server-side 聚合，text 回契約 JSON：
+
+```json
+{
+  "window": { "start": "2026-08-10T00:00:00Z", "end": "2026-08-10T01:00:00Z" },
+  "count": 2,
+  "hotspots": [
+    { "file_path": "src/db/query.rs", "function_name": "query_users",
+      "p99_latency_ms": 1250.0, "call_count": 5000,
+      "alloc_bytes": 10485760, "environment": "production" }
+  ]
+}
+```
+
+- `window` / `count` 選填；`hotspots` 缺省視為無熱點（非錯誤）。
+- `environment` 缺省 `"production"`。
+- 轉譯：熱點 → IngestPayload（source=`"draco-mcp"`）走同一 ingest 管線；
+  Draco 無行號，以 `resolve_symbol(file_path, function_name)` 升維；
+  metric_id 由 `tel-draco-{DefaultHasher(file:func):x}` 安定派生 —
+  重複同步 upsert 同一列，不產生重複 binding。
+- 同步端點：`telemetry_ingest(source="draco-mcp")` → Top 10。
+- 測試：TcpListener mock server 實測 initialize + tools/call 兩段 handshake。

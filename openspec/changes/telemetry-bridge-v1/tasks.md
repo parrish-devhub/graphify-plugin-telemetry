@@ -21,7 +21,7 @@
 🔹 Slice 1：Draco MCP 主動輪詢與門檻過濾
 [x] 實作動態門檻設定（如 p99 > 500ms 或 alloc > 5MB 自動設為 is_hotspot）。
 
-[ ] 透過 draco_client 實現一鍵同步當前 Cluster 的即時 Top 10 熱點。
+[x] 透過 draco_client 實現一鍵同步當前 Cluster 的即時 Top 10 熱點。
 
 🔹 Slice 2：雙向衝擊廣播 (Hotspot Alert Push)
 [ ] 於 on_graph_updated 中整合 BFS 衝擊半徑計算。

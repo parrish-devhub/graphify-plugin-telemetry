@@ -111,6 +111,19 @@ impl TelemetryPlugin {
         self.service.telemetry_ingest_file(path)
     }
 
+    /// `telemetry_ingest`（source = "draco-mcp"）：呼叫 Draco
+    /// `fetch_top_hotspots()` 一鍵同步當前 Cluster 的 Top 熱點。
+    ///
+    /// # Errors
+    /// Draco 呼叫/契約解析失敗回傳 [`crate::ingest::IngestError::Draco`]；
+    /// db 寫入失敗回傳 [`crate::ingest::IngestError::Db`]。
+    pub fn telemetry_ingest_draco(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<IngestReport, IngestError> {
+        self.service.telemetry_ingest_draco(limit)
+    }
+
     /// `telemetry_ingest`（已解析 payload 版本；測試與程式化呼叫用）。
     ///
     /// # Errors

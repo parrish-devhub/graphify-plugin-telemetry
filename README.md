@@ -58,7 +58,7 @@ hotspot 後合成 .toon 可觀測性區塊供 Coding Agent 消費。
 ├── src/
 │   ├── lib.rs        # GraphifyPlugin trait（get_id/bind/get_workspace_key/sync_toon/on_graph_updated）
 │   ├── ingest.rs     # file-based Telemetry JSON import + 轉譯
-│   ├── draco_client.rs # Draco MCP Client 骨架（MCP-over-HTTP，Slice 1 接 fetch_top_hotspots）
+│   ├── draco_client.rs # Draco MCP Client（MCP-over-HTTP，fetch_top_hotspots 契約 v1）
 │   ├── resolver.rs   # Line-to-Symbol Resolver（對齊 GraphOutput）
 │   ├── registry.rs   # telemetry_bindings 表與 DAO（併入 graphify.db）
 │   ├── telemetry.rs  # telemetry_ingest / telemetry_get_context 業務 API + 門檻判定
@@ -87,5 +87,5 @@ cargo build / cargo check / cargo clippy / cargo test
 - 完整架構與技術規格：Architecture & Technical Specification v1.0.0
   （Status: Approved）— 由 graphify-mcp 驗證 `telemetry_ingest` /
   `telemetry_get_context` 自動註冊（Slice 0 完成）。
-- Slice 1：Draco MCP 主動輪詢（`fetch_top_hotspots`）+ 動態門檻。
+- Slice 1：Draco MCP 主動輪詢（`fetch_top_hotspots`）+ 動態門檻 ✅（契約 v1 由本 plugin 定義，見 openspec — public 無 Draco observability server；`DRACO_BASE_URL` 指向實現契約的 server）。
 - Slice 2：`on_graph_updated` BFS 衝擊半徑 + `notifications/telemetry/hotspot_alert` 廣播。
