@@ -19,7 +19,7 @@
 [x] Task 0.6: 經由 graphify-mcp 驗證 telemetry_ingest 與 telemetry_get_context 自動註冊。
 
 🔹 Slice 1：Draco MCP 主動輪詢與門檻過濾
-[ ] 實作動態門檻設定（如 p99 > 500ms 或 alloc > 5MB 自動設為 is_hotspot）。
+[x] 實作動態門檻設定（如 p99 > 500ms 或 alloc > 5MB 自動設為 is_hotspot）。
 
 [ ] 透過 draco_client 實現一鍵同步當前 Cluster 的即時 Top 10 熱點。
 
@@ -35,8 +35,11 @@
 - Slice 0 六任務全部完成並驗證（41 tests green、clippy 0 warnings、
   graphify-mcp 端到端：tools/list 23 tools 含 telemetryIngest /
   telemetryGetContext，ingest 2 bound 1 hotspot）。
+- Slice 1 動態門檻已完成：`ThresholdConfig`（預設 `p99 > 500ms ||
+  alloc > 5MB`，env `TELEMETRY_HOTSPOT_P99_MS` / `TELEMETRY_HOTSPOT_ALLOC_BYTES`
+  覆寫；42 tests green、clippy 0 warnings）。
 - 注意：原規格 Slice 0 任務編號與先前重建版 tasks.md 不同（0.2=DAO /
   0.3=resolver / 0.4=ingest+draco / 0.5=sync / 0.6=mcp），本次已改為逐字
   原編號。
-- Slice 1 前置：probe Draco MCP 4 tools 清單與 base URL（現有
-  `fetch_top_hotspots` 為唯一確認名，port 佔位待修正）。
+- Slice 1 Top 10 熱點同步受阻：workspace 內無 observability Draco（唯一
+  Draco 為網頁 scraper）；`fetch_top_hotspots` 契約待 Draco 端確認後實作。

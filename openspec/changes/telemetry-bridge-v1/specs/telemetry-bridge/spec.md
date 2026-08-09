@@ -68,9 +68,10 @@ Plaintext
   PK — 共用 graphify.db 時不同 workspace 的同名 metric 不互踩；另
   `function_name` 實作為可空（orphan metric 無函式名）、`p50_ms` /
   `p99_ms` 實作為 `DEFAULT 0`。其餘欄位/索引/門檻註解逐字落地。
-- **門檻值矛盾未定案**：schema 註解寫 `p99 > 1000ms`，Slice 1 範例寫
-  `p99 > 500ms`。Slice 0 實作採 schema 註解值（`p99 > 1000ms ||
-  alloc > 5MB`）；Slice 1 動態門檻時定案。
+- **門檻值矛盾已定案（Slice 1）**：schema 註解寫 `p99 > 1000ms`，Slice 1
+  範例寫 `p99 > 500ms`。Slice 0 暫採 schema 註解值；Slice 1 定案為動態
+  `ThresholdConfig` — 預設 `p99 > 500ms || alloc > 5MB`（roadmap 明示值），
+  env `TELEMETRY_HOTSPOT_P99_MS` / `TELEMETRY_HOTSPOT_ALLOC_BYTES` 覆寫。
 - **§6 合成格式為示意**（含 Review Bridge / Impact Radius 行）；Slice 0
   實作採 §5.1 內嵌範例格式（`⚡ [Draco Telemetry] p99 Latency: Xms
   (CRITICAL HOTSPOT)` + `📊 Alloc: Y | Calls: Z/min (env)`）。Impact

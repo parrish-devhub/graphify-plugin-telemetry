@@ -18,8 +18,9 @@ hotspot 後合成 .toon 可觀測性區塊供 Coding Agent 消費。
   穩定的 canonical symbol（AST 重建或行號位移仍保持綁定）。
 - **telemetry_bindings 表**：併入專案共用的 `graphify.db`（`workspace_key`
   隔離），記錄 p99 / alloc / call rate 與 hotspot 旗標。
-- **Hotspot Threshold Guard**：`p99 > 1000ms` 或 `alloc > 5MB` 判定
-  `is_hotspot`（Slice 1 規劃動態門檻）。
+- **Hotspot Threshold Guard**：動態門檻（預設 `p99 > 500ms` 或
+  `alloc > 5MB`）判定 `is_hotspot`；可經由環境變數
+  `TELEMETRY_HOTSPOT_P99_MS` / `TELEMETRY_HOTSPOT_ALLOC_BYTES` 覆寫。
 - **MCP 自動註冊**：`telemetry_ingest` / `telemetry_get_context` 由
   graphify-mcp 於啟動時自動註冊。
 - **.toon 語意合成**：`sync_toon` 將 hotspots 合成可觀測性區塊

@@ -23,19 +23,58 @@ use crate::registry::{TelemetryBinding, TelemetryDb};
 use crate::resolver::resolve_line;
 use crate::sync::{emit_error_packet, emit_packet, synthesize_hotspot_block, HotspotView};
 
-/// p99 熱點門檻（毫秒）。schema §3.2 comment：`p99 > 1000ms`。
-pub const P99_HOTSPOT_MS: f64 = 1000.0;
-
-/// alloc 熱點門檻（位元組/req）。Slice 1 範例值：5MB。
-pub const ALLOC_HOTSPOT_BYTES: i64 = 5 * 1024 * 1024;
-
-/// 評估單筆指標是否為 Critical Hotspot。
+/// 動態熱點門檻（Slice 1：動態門檻設定）。
 ///
-/// `p99_ms > P99_HOTSPOT_MS`（延遲）或 `alloc_bytes > ALLOC_HOTSPOT_BYTES`
-/// （記憶體）任一超過即為 hotspot。
-#[must_use]
-pub fn is_hotspot(p99_ms: f64, alloc_bytes: i64) -> bool {
-    p99_ms > P99_HOTSPOT_MS || alloc_bytes > ALLOC_HOTSPOT_BYTES
+/// 預設值採 Slice 1 roadmap 明示範例 `p99 > 500ms || alloc > 5MB`，取代
+/// schema §3.2 註解的 `1000ms`（原規格兩處衝突，Slice 1 定案為 500ms）。
+/// 可經由環境變數 `TELEMETRY_HOTSPOT_P99_MS`（f64 毫秒）與
+/// `TELEMETRY_HOTSPOT_ALLOC_BYTES`（i64 位元組）覆寫 — 與 `DRACO_BASE_URL`
+/// 同款動態設定慣例（啟動時讀取，非程序級秘密持久化）。
+///
+/// ponytail: 全域 env 門檻，per-workspace 設定（存 registry）於需要
+/// workspace 級差異時再引入。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThresholdConfig {
+    /// p99 延遲門檻（毫秒）。
+    pub p99_ms: f64,
+    /// 每次請求記憶體配置門檻（bytes）。
+    pub alloc_bytes: i64,
+}
+
+impl Default for ThresholdConfig {
+    fn default() -> Self {
+        Self {
+            p99_ms: 500.0,
+            alloc_bytes: 5 * 1024 * 1024,
+        }
+    }
+}
+
+impl ThresholdConfig {
+    /// 從環境變數建構；未設定（或解析失敗）時回退預設值。
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(v) = std::env::var("TELEMETRY_HOTSPOT_P99_MS") {
+            if let Ok(ms) = v.trim().parse::<f64>() {
+                cfg.p99_ms = ms;
+            }
+        }
+        if let Ok(v) = std::env::var("TELEMETRY_HOTSPOT_ALLOC_BYTES") {
+            if let Ok(b) = v.trim().parse::<i64>() {
+                cfg.alloc_bytes = b;
+            }
+        }
+        cfg
+    }
+
+    /// 評估單筆指標是否為 Critical Hotspot：
+    /// `p99_ms > self.p99_ms`（延遲）或 `alloc_bytes > self.alloc_bytes`
+    /// （記憶體）任一超過即為 hotspot。
+    #[must_use]
+    pub fn is_hotspot(self, p99_ms: f64, alloc_bytes: i64) -> bool {
+        p99_ms > self.p99_ms || alloc_bytes > self.alloc_bytes
+    }
 }
 
 /// 一次 ingest 的結果摘要。
@@ -62,6 +101,8 @@ pub struct TelemetryService {
     graph_cache: RwLock<Option<GraphOutput>>,
     /// Draco MCP client 骨架（Slice 1/2 接真呼叫）。
     draco_client: DracoMcpClient,
+    /// Hotspot 判定門檻（動態設定，env 可覆寫）。
+    threshold: ThresholdConfig,
 }
 
 impl Default for TelemetryService {
@@ -79,6 +120,7 @@ impl TelemetryService {
             registry_path: None,
             graph_cache: RwLock::new(None),
             draco_client: DracoMcpClient::new(default_draco_url()),
+            threshold: ThresholdConfig::from_env(),
         }
     }
 
@@ -93,6 +135,13 @@ impl TelemetryService {
     #[must_use]
     pub fn with_draco_url(mut self, url: impl Into<String>) -> Self {
         self.draco_client = DracoMcpClient::new(url);
+        self
+    }
+
+    /// 覆寫 hotspot 判定門檻（動態設定；測試注入）。
+    #[must_use]
+    pub fn with_threshold(mut self, threshold: ThresholdConfig) -> Self {
+        self.threshold = threshold;
         self
     }
 
@@ -171,7 +220,7 @@ impl TelemetryService {
                 bound += 1;
             }
 
-            let hot = is_hotspot(metric.p99_ms, metric.alloc_bytes_per_req);
+            let hot = self.threshold.is_hotspot(metric.p99_ms, metric.alloc_bytes_per_req);
             if hot {
                 hotspots += 1;
             }
@@ -358,11 +407,43 @@ mod tests {
 
     #[test]
     fn hotspot_thresholds() {
-        assert!(!is_hotspot(100.0, 1024));
-        assert!(is_hotspot(1250.0, 1024), "p99 over 1000ms");
-        assert!(!is_hotspot(1000.0, 1024), "p99 must exceed 1000ms");
-        assert!(is_hotspot(100.0, 6 * 1024 * 1024), "alloc over 5MB");
-        assert!(!is_hotspot(100.0, 5 * 1024 * 1024), "alloc must exceed 5MB");
+        // 預設門檻（Slice 1 定案）：p99 > 500ms || alloc > 5MB。
+        let def = ThresholdConfig::default();
+        assert_eq!(def.p99_ms, 500.0);
+        assert_eq!(def.alloc_bytes, 5 * 1024 * 1024);
+        assert!(!def.is_hotspot(100.0, 1024));
+        assert!(def.is_hotspot(501.0, 1024), "p99 over 500ms");
+        assert!(!def.is_hotspot(500.0, 1024), "p99 must exceed 500ms");
+        assert!(def.is_hotspot(100.0, 5 * 1024 * 1024 + 1), "alloc over 5MB");
+        assert!(!def.is_hotspot(100.0, 5 * 1024 * 1024), "alloc must exceed 5MB");
+
+        // 自訂門檻（動態設定可覆寫）。
+        let custom = ThresholdConfig { p99_ms: 1000.0, alloc_bytes: 1024 };
+        assert!(!custom.is_hotspot(600.0, 1024), "600ms 低於自訂 1000ms");
+        assert!(custom.is_hotspot(100.0, 2048), "alloc 超過自訂 1KB");
+    }
+
+    #[test]
+    fn ingest_respects_custom_threshold() {
+        let (_d, mut svc) = service_with_tmp_db();
+        svc = svc.with_threshold(ThresholdConfig { p99_ms: 1000.0, alloc_bytes: 1024 });
+        feed_graph(&svc);
+        // 600ms：低於自訂 1000ms → 非 hotspot。
+        let report = svc
+            .telemetry_ingest(&payload("w-1", vec![metric("tel-1", 600.0, 1024)]))
+            .unwrap();
+        assert_eq!(
+            report,
+            IngestReport { total: 1, bound: 1, orphan: 0, hotspots: 0 }
+        );
+        // 2KB alloc：超過自訂 1KB → hotspot。
+        let report = svc
+            .telemetry_ingest(&payload("w-1", vec![metric("tel-2", 100.0, 2048)]))
+            .unwrap();
+        assert_eq!(
+            report,
+            IngestReport { total: 1, bound: 1, orphan: 0, hotspots: 1 }
+        );
     }
 
     #[test]
