@@ -96,7 +96,9 @@ pub fn resolve_symbol(
     })
 }
 
-/// `node_path` 是否代表 `want`（workspace-root 相對路徑）。/// 精確相等，或兩者都以 `/` 分隔且 node_path 以 `want` 結尾。
+/// `node_path` 是否代表 `want`（workspace-root 相對路徑）。
+/// 精確相等，或兩者都以 `/` 分隔且 node_path 以 `want` 結尾，
+/// 或 want 以 node_path 結尾（反向匹配，處理 lcov 給絕對路徑而 graph 給相對路徑的情況）。
 #[must_use]
 pub fn file_matches(node_path: &str, want: &str) -> bool {
     if node_path == want {
@@ -105,14 +107,25 @@ pub fn file_matches(node_path: &str, want: &str) -> bool {
     if want.is_empty() {
         return false;
     }
-    // 只做有把握的 suffix 比對：want 本身含 `/`（是相對路徑而非檔名）
+
+    // 正向：node_path 以 want 結尾（graph 路徑長，coverage 路徑短）
     if want.contains('/') {
         let n = node_path.strip_suffix(want);
         if let Some(prefix) = n {
-            // 前綴必須是空字串或結尾為 '/'，避免 "foosrc/auth.rs" 誤配
             return prefix.is_empty() || prefix.ends_with('/');
         }
     }
+
+    // 反向：want 以 node_path 結尾（coverage 路徑長，graph 路徑短）
+    // 去掉 graph 路徑的 `./` 前綴再比對
+    let clean_path = node_path.strip_prefix("./").unwrap_or(node_path);
+    if clean_path.contains('/') {
+        let n = want.strip_suffix(clean_path);
+        if let Some(prefix) = n {
+            return prefix.is_empty() || prefix.ends_with('/');
+        }
+    }
+
     false
 }
 
@@ -196,6 +209,22 @@ mod tests {
         assert!(resolve_line(&g, "src/a.rs", 3).is_some());
         // 不含 '/' 的 want（純檔名）不做 suffix 匹配
         assert!(resolve_line(&g, "a.rs", 3).is_none());
+    }
+
+    #[test]
+    fn file_matches_bidirectional() {
+        // 正向：node_path 以 want 結尾（graph 路徑長，coverage 路徑短）
+        assert!(file_matches("./src/auth.rs", "src/auth.rs")); // ./ prefix handled by reverse
+        assert!(file_matches("src/auth.rs", "/repo/src/auth.rs")); // reverse should match
+        assert!(file_matches("./src/auth.rs", "/mnt/data/project/src/auth.rs")); // reverse with ./ stripping
+        assert!(!file_matches("./src/other.rs", "/mnt/data/project/src/auth.rs")); // different file
+        // 混合正向 + 反向
+        assert!(file_matches("/absolute/path/src/auth.rs", "src/auth.rs")); // absolute vs relative
+        assert!(file_matches("./src/auth.rs", "src/auth.rs")); // both relative
+        // 負向測試
+        assert!(!file_matches("./src/auth.rs", "src/auth/verify.rs")); // wrong path
+        assert!(file_matches("./src/auth.rs", "src/auth.rs")); // exact match
+        assert!(!file_matches("src/auth.rs", "./src/other.rs")); // reverse wrong
     }
 
     #[test]
